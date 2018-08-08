@@ -1,29 +1,36 @@
 package com.springtale.ali;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 通用本地缓存
- * 1.线程安全
- * 2.不设置缓存加载器则只保存key与时间
- * 3.expireTime默认设置30分钟，设置时间不大于0时使用默认值
- * 4.concurrentLevel需设置为2的n次幂，表示并发度
- * 5.本缓存未设置缓存上限，由用户根据业务需求进行控制
  * Created by wsy on 2018/8/8.
  */
 public class SimpleCache<K, V> {
-    private final ConcurrentHashMap<K, CacheEntry<V>> innerCacheMap = new ConcurrentHashMap<K, CacheEntry<V>>();
-
+    private ConcurrentHashMap<K, CacheEntry<V>> innerCacheMap;
+    // TODO: 2018/8/8 0008 判断缓存满了，并移除时有并发问题
     // 最小并发数
     private static final int MIN_CONCURRENT_LEVEL = 1;
     // 最大并发数
     private static final int MAX_CONCURRENT_LEVEL = Integer.MAX_VALUE>>1 + 1;
-    // 默认8个并发
-    private int concurrentLevel = 8;
+    // 默认超时时间30分钟
+    private static final long DEFAULT_EXPIRE_TIME = 30 * 60 * 1000;
+    // 并发度
+    private int concurrentLevel;
 
-    // 默认30分钟过期
-    private long expireTime = 30 * 60 * 1000;
+    // 初始容量
+    private int initialCapacity;
+
+    // 缓存数量控制
+    private long cacheSizeCtl;
+
+    // 移除选取样本数量
+    private int evictSampleSize;
+
+    // 过期时间
+    private long expireTime;
 
     // 并发分段锁
     private ReentrantLock[] locks;
@@ -31,36 +38,92 @@ public class SimpleCache<K, V> {
     // 缓存加载器
     private CacheLoader<K, V> cacheLoader;
 
-    public SimpleCache(long expireTime, int concurrentLevel, CacheLoader<K, V> cacheLoader) {
-        this(expireTime, concurrentLevel);
-        this.cacheLoader = cacheLoader;
-    }
-
-    public SimpleCache(long expireTime, int concurrentLevel) {
-        init(expireTime, concurrentLevel);
-    }
-
-    public void init(long expireTime, int concurrentLevel) {
-        if (expireTime > 0) {
-            this.expireTime = expireTime;
+    // 初始化方法
+    public void init() {
+        if (expireTime < 0) {
+            expireTime = DEFAULT_EXPIRE_TIME;
         }
         // 保证concurrentLevel为2的n次幂
         if (concurrentLevel <= MIN_CONCURRENT_LEVEL) {
-            this.concurrentLevel = MIN_CONCURRENT_LEVEL;
+            concurrentLevel = MIN_CONCURRENT_LEVEL;
         }else if (concurrentLevel >= MAX_CONCURRENT_LEVEL) {
-            this.concurrentLevel = MAX_CONCURRENT_LEVEL;
+            concurrentLevel = MAX_CONCURRENT_LEVEL;
         }else {
             int powerTwo = 1;
             while (powerTwo < concurrentLevel) {
                 powerTwo = powerTwo << 1;
             }
-            this.concurrentLevel = powerTwo;
+            concurrentLevel = powerTwo;
         }
 
+        innerCacheMap = new ConcurrentHashMap<>(initialCapacity);
+
         // 初始化分段锁
-        this.locks = new ReentrantLock[this.concurrentLevel];
-        for (int i=0; i<this.concurrentLevel; i++) {
-            this.locks[i] = new ReentrantLock();
+        locks = new ReentrantLock[concurrentLevel];
+        for (int i=0; i<concurrentLevel; i++) {
+            locks[i] = new ReentrantLock();
+        }
+    }
+
+    public static class Builder<K, V> {
+        // 默认16并发
+        private int concurrentLevel = 16;
+
+        // 初始容量，默认64
+        private int initialCapacity = 64;
+
+        // 缓存数量控制，默认1000
+        private long cacheSizeCtl = 1000;
+
+        // 移除选取样本数量，默认50个
+        private int evictSampleSize = 50;
+
+        // 默认30分钟过期
+        private long expireTime = 30 * 60 * 1000;
+
+        // 缓存加载器
+        private CacheLoader<K, V> cacheLoader;
+
+        public Builder<K, V> concurrentLevel(int concurrentLevel) {
+            this.concurrentLevel = concurrentLevel;
+            return this;
+        }
+
+        public Builder<K, V> initialCapacity(int initialCapacity) {
+            this.initialCapacity = initialCapacity;
+            return this;
+        }
+
+        public Builder<K, V> cacheSizeCtl(long cacheSizeCtl) {
+            this.cacheSizeCtl = cacheSizeCtl;
+            return this;
+        }
+
+        public Builder<K, V> evictSampleSize(int evictSampleSize) {
+            this.evictSampleSize = evictSampleSize;
+            return this;
+        }
+
+        public Builder<K, V> expireTime(long expireTime) {
+            this.expireTime = expireTime;
+            return this;
+        }
+
+        public Builder<K, V> cacheLoader(CacheLoader<K, V> cacheLoader) {
+            this.cacheLoader = cacheLoader;
+            return this;
+        }
+
+        public SimpleCache<K, V> build() {
+            SimpleCache<K, V> simpleCache = new SimpleCache<K, V>();
+            simpleCache.concurrentLevel = this.concurrentLevel;
+            simpleCache.initialCapacity = this.initialCapacity;
+            simpleCache.cacheSizeCtl = this.cacheSizeCtl;
+            simpleCache.evictSampleSize = this.evictSampleSize;
+            simpleCache.expireTime = this.expireTime;
+            simpleCache.cacheLoader = this.cacheLoader;
+            simpleCache.init();
+            return simpleCache;
         }
     }
 
@@ -70,10 +133,10 @@ public class SimpleCache<K, V> {
      * @param value
      * @return
      */
-    public V addOrRefresh(K key, V value) {
-        CacheEntry<V> cacheEntry = new CacheEntry<V>(System.currentTimeMillis()+expireTime, value);
-        innerCacheMap.put(key, cacheEntry);
-        return value;
+    public V put(K key, V value) {
+        V result = loadOrRefresh(key, value);
+        lockedPostProcess(key);
+        return result;
     }
 
     /**
@@ -82,10 +145,9 @@ public class SimpleCache<K, V> {
      * @return
      */
     public V addOrRefresh(K key) {
-        V cache = loadCache(key);
-        CacheEntry<V> cacheEntry = new CacheEntry<V>(System.currentTimeMillis()+expireTime, cache);
-        innerCacheMap.put(key, cacheEntry);
-        return cache;
+        V result = loadOrRefresh(key);
+        lockedPostProcess(key);
+        return result;
     }
 
     /**
@@ -94,11 +156,60 @@ public class SimpleCache<K, V> {
      * @return
      */
     public V get(K key) {
+        // 先尝试从缓存中获取
         V result = getUnexpiredValue(key);
         if (null == result) {
+            // 不在缓存中则进行加载
             result = lockedLoad(key);
         }
         return result;
+    }
+
+    /**
+     * 删除指定缓存
+     * @param key
+     * @return
+     */
+    public V remove(K key) {
+        return innerCacheMap.remove(key).getCacheObj();
+    }
+
+    /**
+     * 清空所有缓存
+     */
+    public void reCache() {
+        innerCacheMap = new ConcurrentHashMap<>(initialCapacity);
+    }
+
+
+
+    private V loadOrRefresh(K key) {
+        return loadOrRefresh(key, null);
+    }
+
+    private V loadOrRefresh(K key, V value) {
+        if (null == value) {
+            value = loadCache(key);
+        }
+        CacheEntry<V> cacheEntry = new CacheEntry<>(System.currentTimeMillis()+expireTime, value);
+        innerCacheMap.put(key, cacheEntry);
+        return value;
+    }
+
+    /**
+     * 增加或更新的后置处理，用于维持缓存数量
+     * @param key
+     */
+    private void lockedPostProcess(K key) {
+        ReentrantLock lock = lockOf(key);
+        lock.lock();
+        try {
+            if (shouldEvict()) {
+                approxiRemoveCache(evictSampleSize);
+            }
+        }finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -113,7 +224,11 @@ public class SimpleCache<K, V> {
             // 再次判断，避免多次加载
             V result = getUnexpiredValue(key);
             if (null == result) {
-                result = addOrRefresh(key);
+                result = loadOrRefresh(key);
+                if (shouldEvict()) {
+                    // 清理缓存
+                    approxiRemoveCache(evictSampleSize);
+                }
             }
             return result;
         }finally {
@@ -121,7 +236,11 @@ public class SimpleCache<K, V> {
         }
     }
 
-    // 加载缓存信息
+    /**
+     * 加载缓存信息
+     * @param key
+     * @return
+     */
     private V loadCache(K key) {
         if (null != cacheLoader) {
             return cacheLoader.loadCache(key);
@@ -152,6 +271,42 @@ public class SimpleCache<K, V> {
         return null;
     }
 
+    /**
+     * 随机选取一定的样本，移除其中时间最早的缓存
+     * @param sampleSize 样本数量
+     * @return
+     */
+    private V approxiRemoveCache(int sampleSize) {
+        sampleSize = sampleSize < 1 ? 1 : sampleSize;
+        Map.Entry<K, CacheEntry<V>> removeEntry = null;
+        for (Map.Entry<K, CacheEntry<V>> entry : innerCacheMap.entrySet()) {
+            if (0 < sampleSize--) {
+                if (null == removeEntry) {
+                    removeEntry = entry;
+                }else {
+                    removeEntry = removeEntry.getValue().getExpireAt() > entry.getValue().getExpireAt() ? entry : removeEntry;
+                }
+            }else {
+                break;
+            }
+        }
+        if (null == removeEntry) {
+            return null;
+        }
+        return innerCacheMap.remove(removeEntry.getKey()).getCacheObj();
+    }
+
+    private boolean shouldEvict() {
+        if (cacheSizeCtl > 0) {
+            return this.cacheSizeCtl < getSize();
+        }
+        return false;
+    }
+
+    public long getSize() {
+        return innerCacheMap.mappingCount();
+    }
+
     public CacheLoader<K, V> getCacheLoader() {
         return cacheLoader;
     }
@@ -161,10 +316,10 @@ public class SimpleCache<K, V> {
     }
 
     /**
-     * 封装时间、缓存实体
+     * 封装过期时间、缓存实体
      * @param <E>
      */
-    private static class CacheEntry<E> {
+    static class CacheEntry<E> {
         private long expireAt;
         private E cacheObj;
 
