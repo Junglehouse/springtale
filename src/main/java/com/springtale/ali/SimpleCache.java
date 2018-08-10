@@ -11,6 +11,10 @@ import java.util.concurrent.locks.ReentrantLock;
 public class SimpleCache<K, V> {
     private ConcurrentHashMap<K, CacheEntry<V>> innerCacheMap;
     // TODO: 2018/8/8 0008 判断缓存满了，并移除时有并发问题
+    /**
+     * 1、将缓存数量控制分割到每个分段内，这样每个分段控制数量
+     * 2、将缓存的新增与更新操作分开，数量控制只需在新增时判断
+     */
     // 最小并发数
     private static final int MIN_CONCURRENT_LEVEL = 1;
     // 最大并发数
